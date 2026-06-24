@@ -1,2 +1,6 @@
 /dataset/train/*
 /dataset/augmentations/*
+# tensorboard logs
+/submissions/*/runs/
+# the weights
+/submissions/my_team/weights.joblib
