@@ -1,0 +1,77 @@
+REPLACE_NAME1,REPLACE_NAME2
+REPLACE_ID1,REPLACE_ID2
+
+== Robust 20-class image classification ==
+
+Model
+-----
+ModelArchitecture is a ResNet-18 (BasicBlocks, stages [2,2,2,2], widths
+64/128/256/512) trained entirely from random initialization, outputting 20
+logits for a [B,3,224,224] ImageNet-normalized input. We chose ResNet-18
+because its ~11M-parameter capacity suits ~18k training images without heavy
+overfitting, residual connections make from-scratch optimization stable, and
+the design is simple to reason about and defend. We add the standard
+zero-initialization of the last BatchNorm in each residual block (blocks start
+as identities), Kaiming initialization, and a small dropout (0.2) before the
+classifier. Robustness comes from the *training strategy*, not from anything
+special in the architecture.
+
+Training
+--------
+- Data split: 90% train / 10% clean validation, stratified by a fixed seed.
+  Crucially, every training image that has a provided augmented counterpart is
+  forced into validation, so our out-of-distribution probe never overlaps with
+  images the model trained on (no leakage).
+- Optimizer: SGD (momentum 0.9, Nesterov, weight decay 5e-4).
+- Schedule: 3-epoch linear warmup then cosine decay over 50 epochs.
+- Loss: cross-entropy with label smoothing 0.1.
+- Batch size 128, input 224x224.
+- Normalization: ImageNet mean/std. This is mandatory (not a pretraining
+  artifact): the grader applies it at test time, so train and test must match.
+- The validation / OOD transforms replicate the grader's pipeline exactly
+  (Resize 256 -> CenterCrop 224 -> ToTensor -> Normalize).
+
+Manipulations and where we inserted them
+----------------------------------------
+All manipulations are applied during TRAINING only; validation and test images
+stay clean (grader format), so our accuracy numbers measure true generalization
+rather than the model being graded on the same trick it trained on.
+
+The manipulations we used (inserted in the training transform):
+- RandomResizedCrop + RandomHorizontalFlip  -> scale / position / framing
+- ColorJitter (brightness/contrast/saturation/hue) -> colour & lighting shifts
+- RandomGrayscale                            -> extreme colour distortion
+- RandomErasing                              -> occlusion / missing context
+
+Insertion strategy: an augmentation *curriculum*.
+We do NOT augment heavily from step 0. A from-scratch network learns slowly
+under aggressive augmentation, so we train with light geometric augmentation
+only (crop + flip) until clean-val accuracy crosses a 0.60 threshold, then
+switch on the full colour/occlusion augmentation set ("delayed introduction").
+This builds good features first and teaches invariance once the model is
+competent. In our run the switch fired at epoch 5 (clean-val 0.607); a forced
+fallback at 40% of epochs guarantees the switch even if the threshold is never
+reached.
+
+One deliberate choice: we keep *rotation* OUT of training. The provided
+random_rotation augmentation is used as a FROZEN out-of-distribution test --
+a manipulation family the model never trains on -- so its accuracy is an honest
+estimate of how we generalize to the grader's unseen manipulations. We tune
+against color_jitter (treated as an OOD-validation signal) and evaluate
+random_rotation exactly once, on the selected checkpoint.
+
+How it impacted performance
+---------------------------
+Checkpoint selected by 0.5*clean-val + 0.5*OOD-val (mirrors the 50/50 grade):
+- Clean validation accuracy:                0.923
+- color_jitter (trained-against OOD-val):   0.940
+- random_rotation (FROZEN, never trained):  0.920
+
+The headline result: random_rotation -- a manipulation we never trained on --
+holds at 0.920, essentially equal to clean accuracy. Before the curriculum
+switch the OOD sets lagged clean accuracy by ~5 points; once heavy augmentation
+turned on, that gap closed to ~1-2 points and the OOD accuracy often slightly
+exceeded clean accuracy. The train/val gap stayed small (~5 points) with val
+still rising at the end, indicating the model generalizes rather than memorizes.
+We verified these numbers through the grader's own predict.py path and confirmed
+predictions are spread across all 20 classes (no degenerate class collapse).
