@@ -9,10 +9,10 @@ Run from anywhere (paths are resolved relative to this file, not the cwd):
 Output: weights.joblib (a CPU state_dict) written next to this file, exactly
 as the grader expects.
 
-This is the *baseline* pipeline. It already bakes in colour/lighting/geometry
-robustness augmentations (the cheap, high-value ones). The heavier robustness
-ideas -- background replacement, style/texture randomization, etc. -- plug in
-at `build_train_transform()` and are the focus of the next iteration.
+Robustness uses an augmentation curriculum: train with light geometric aug
+until clean-val passes a threshold, then switch on heavy colour/occlusion aug
+(`build_light_transform` -> `build_heavy_transform`). Rotation is deliberately
+kept out of training so `random_rotation` stays a valid frozen OOD-test.
 """
 
 import argparse
@@ -50,6 +50,13 @@ NUM_CLASSES = 20
 SEED = 42
 VAL_FRACTION = 0.1
 
+# OOD policy: of the two provided augmentation types, one is the *tuning* signal
+# (may influence model selection) and the other is a frozen *test* that we look
+# at exactly once, on the final selected checkpoint. This simulates the grader's
+# real setup -- it scores us on manipulations we never got to tune against.
+OOD_VAL_NAME = "color_jitter"      # tuning signal -> enters the selection score
+OOD_TEST_NAME = "random_rotation"  # frozen -> evaluated only at the very end
+
 
 # ---------------------------------------------------------------------------
 # Device
@@ -65,15 +72,29 @@ def get_device() -> torch.device:
 # ---------------------------------------------------------------------------
 # Transforms
 # ---------------------------------------------------------------------------
-def build_train_transform() -> transforms.Compose:
-    """Training-time augmentation.
+def build_light_transform() -> transforms.Compose:
+    """Phase-1 (pre-threshold) augmentation: gentle geometry only.
 
-    The eval transform below is fixed by the grader; everything that makes the
-    model *robust* lives here. The current set targets exactly the kinds of
-    held-out manipulations described in the brief:
-      - ColorJitter / RandomGrayscale  -> colour & lighting distortions
-      - RandomResizedCrop / flip       -> scale, position, framing
-      - RandomErasing                  -> occlusion / missing context
+    Heavy colour/occlusion augmentation from step 0 slows a from-scratch model.
+    Phase 1 keeps it near-clean so the network can build solid features fast.
+    """
+    return transforms.Compose([
+        transforms.RandomResizedCrop(IMAGE_SIZE, scale=(0.7, 1.0)),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+    ])
+
+
+def build_heavy_transform() -> transforms.Compose:
+    """Phase-2 (post-threshold) augmentation: the robustness driver.
+
+    Switched on once the model passes a clean-val threshold. Targets the exact
+    manipulations in the brief -- colour, lighting, occlusion, framing.
+
+    NOTE: deliberately NO rotation. `random_rotation` is our *frozen* OOD-test;
+    training on rotation would turn it in-distribution and void the honest test.
+    Colour jitter IS included -- `color_jitter` is the tuning OOD signal.
     """
     return transforms.Compose([
         transforms.RandomResizedCrop(IMAGE_SIZE, scale=(0.5, 1.0)),
@@ -121,11 +142,13 @@ def collect_aug_originals() -> set:
     return names
 
 
-def make_splits(train_tf, eval_tf):
-    """Build leakage-safe train / validation Subsets over dataset/train."""
-    train_full = ImageNetSubset(DATA_ROOT, "train", transform=train_tf)
-    eval_full = ImageNetSubset(DATA_ROOT, "train", transform=eval_tf)
-    samples = train_full.samples
+def make_splits():
+    """Leakage-safe train/val *index* split over dataset/train.
+
+    Returns indices (not Subsets) so the train transform can be swapped mid-run
+    for the augmentation curriculum without re-deciding the split.
+    """
+    samples = ImageNetSubset(DATA_ROOT, "train").samples
     n = len(samples)
 
     aug_originals = collect_aug_originals()
@@ -141,13 +164,17 @@ def make_splits(train_tf, eval_tf):
     val_idx = forced_val + rest[:extra]
     train_idx = rest[extra:]
 
-    train_set = Subset(train_full, train_idx)
-    val_set = Subset(eval_full, val_idx)
     print(
         f"Split: {len(train_idx)} train / {len(val_idx)} val "
         f"({len(forced_val)} val images held out to protect the OOD probe)"
     )
-    return train_set, val_set
+    return train_idx, val_idx
+
+
+def build_train_loader(dataset, batch_size, workers):
+    return DataLoader(dataset, batch_size=batch_size, shuffle=True,
+                      num_workers=workers, drop_last=True,
+                      persistent_workers=workers > 0)
 
 
 def build_ood_loaders(eval_tf, batch_size, workers):
@@ -170,31 +197,40 @@ def build_ood_loaders(eval_tf, batch_size, workers):
 # ---------------------------------------------------------------------------
 def train_one_epoch(model, loader, criterion, optimizer, scheduler, device):
     model.train()
-    running_loss, correct, total = 0.0, 0, 0
+    # Keep running stats on-device and sync only once per epoch. Calling
+    # .item() every step forces a host<->GPU sync that serializes MPS and
+    # tanks throughput (~5x slower in practice).
+    loss_sum = torch.zeros((), device=device)
+    correct = torch.zeros((), device=device)
+    total = 0
     for x, y in loader:
+        # NB: do NOT use non_blocking=True here. On MPS the async copy can race
+        # with the next kernel, feeding *garbage labels* into the loss -- which
+        # silently corrupts training (model collapses) and inflates accuracy.
         x, y = x.to(device), y.to(device)
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         logits = model(x)
         loss = criterion(logits, y)
         loss.backward()
         optimizer.step()
         scheduler.step()
 
-        running_loss += loss.item() * y.size(0)
-        correct += (logits.argmax(1) == y).sum().item()
+        loss_sum += loss.detach() * y.size(0)
+        correct += (logits.argmax(1) == y).sum()
         total += y.size(0)
-    return running_loss / total, correct / total
+    return (loss_sum / total).item(), (correct / total).item()
 
 
 @torch.no_grad()
 def evaluate(model, loader, device) -> float:
     model.eval()
-    correct, total = 0, 0
+    correct = torch.zeros((), device=device)
+    total = 0
     for x, y in loader:
         x, y = x.to(device), y.to(device)
-        correct += (model(x).argmax(1) == y).sum().item()
+        correct += (model(x).argmax(1) == y).sum()
         total += y.size(0)
-    return correct / total if total else 0.0
+    return (correct / total).item() if total else 0.0
 
 
 def build_scheduler(optimizer, epochs, steps_per_epoch, warmup_epochs=3):
@@ -221,6 +257,11 @@ def parse_args():
     p.add_argument("--weight-decay", type=float, default=5e-4)
     p.add_argument("--workers", type=int, default=4)
     p.add_argument("--label-smoothing", type=float, default=0.1)
+    p.add_argument("--aug-threshold", type=float, default=0.6,
+                   help="Clean-val accuracy that triggers heavy augmentation.")
+    p.add_argument("--force-switch-frac", type=float, default=0.4,
+                   help="Force the heavy-aug switch by this fraction of epochs "
+                        "even if the threshold was never reached.")
     p.add_argument("--smoke", action="store_true",
                    help="Fast end-to-end check: 2 epochs on a small data subset.")
     return p.parse_args()
@@ -232,23 +273,35 @@ def main():
     device = get_device()
     print(f"Device: {device}")
 
-    train_tf, eval_tf = build_train_transform(), build_eval_transform()
-    train_set, val_set = make_splits(train_tf, eval_tf)
-    ood_loaders = build_ood_loaders(eval_tf, args.batch_size, args.workers)
+    eval_tf = build_eval_transform()
+    train_idx, val_idx = make_splits()
+    # `train_full` carries the *current* augmentation; we mutate its .transform
+    # at the curriculum switch and rebuild the loader so workers pick it up.
+    train_full = ImageNetSubset(DATA_ROOT, "train", transform=build_light_transform())
+    val_full = ImageNetSubset(DATA_ROOT, "train", transform=eval_tf)
+    train_set = Subset(train_full, train_idx)
+    val_set = Subset(val_full, val_idx)
+
+    # Val/OOD sets are small; single-process decode (~389 img/s) already
+    # outpaces eval compute, so 0 workers avoids needless per-epoch respawning.
+    ood_loaders = build_ood_loaders(eval_tf, args.batch_size, workers=0)
+    ood_val_loader = ood_loaders.get(OOD_VAL_NAME)    # tuning signal
+    ood_test_loader = ood_loaders.get(OOD_TEST_NAME)  # frozen until the end
 
     epochs = args.epochs
     if args.smoke:
         epochs = 2
-        train_set = Subset(train_set, list(range(min(len(train_set), 1500))))
-        val_set = Subset(val_set, list(range(min(len(val_set), 500))))
+        # Sample randomly (not range()) so the subsets stay class-balanced --
+        # the splits are class-ordered, so range() would grab one class.
+        g = torch.Generator().manual_seed(SEED)
+        ti = torch.randperm(len(train_set), generator=g)[:1500].tolist()
+        vi = torch.randperm(len(val_set), generator=g)[:500].tolist()
+        train_set, val_set = Subset(train_set, ti), Subset(val_set, vi)
         print(f"[smoke] {len(train_set)} train / {len(val_set)} val, {epochs} epochs")
 
-    persistent = args.workers > 0
-    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True,
-                              num_workers=args.workers, drop_last=True,
-                              persistent_workers=persistent)
+    train_loader = build_train_loader(train_set, args.batch_size, args.workers)
     val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False,
-                            num_workers=args.workers, persistent_workers=persistent)
+                            num_workers=0)
 
     model = ModelArchitecture(num_classes=NUM_CLASSES).to(device)
     criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
@@ -267,46 +320,78 @@ def main():
 
     best_score = -1.0
     best_state = None
+    best = {}
+
+    # Curriculum state: phase 1 = light aug, phase 2 = heavy aug. We switch when
+    # clean-val crosses the threshold, or force it by force_switch_epoch so a
+    # model that plateaus below the bar still gets its robustness training.
+    phase = 1
+    force_switch_epoch = max(1, int(epochs * args.force_switch_frac))
+    print(f"Curriculum: light aug -> heavy at clean-val>={args.aug_threshold:.2f} "
+          f"or epoch {force_switch_epoch} (whichever first)")
 
     for epoch in range(1, epochs + 1):
         tr_loss, tr_acc = train_one_epoch(
             model, train_loader, criterion, optimizer, scheduler, device
         )
         val_acc = evaluate(model, val_loader, device)
-        ood_accs = {name: evaluate(model, ld, device) for name, ld in ood_loaders.items()}
-        mean_ood = sum(ood_accs.values()) / len(ood_accs) if ood_accs else val_acc
+        # OOD-val (color_jitter) is allowed to influence selection; OOD-test
+        # (random_rotation) is deliberately NOT evaluated here -- it stays frozen.
+        ood_val_acc = evaluate(model, ood_val_loader, device) if ood_val_loader else val_acc
         # Selection metric mirrors the 50/50 clean-vs-OOD grading.
-        score = 0.5 * val_acc + 0.5 * mean_ood
+        score = 0.5 * val_acc + 0.5 * ood_val_acc
 
         lr_now = optimizer.param_groups[0]["lr"]
-        ood_str = " ".join(f"{k}={v:.3f}" for k, v in ood_accs.items())
         print(
-            f"epoch {epoch:3d}/{epochs} | lr {lr_now:.4f} | "
+            f"epoch {epoch:3d}/{epochs} | lr {lr_now:.4f} | phase {phase} | "
             f"train_loss {tr_loss:.3f} acc {tr_acc:.3f} | "
-            f"val {val_acc:.3f} | ood[{ood_str}] mean {mean_ood:.3f} | score {score:.3f}"
+            f"val {val_acc:.3f} | ood_val {ood_val_acc:.3f} | score {score:.3f}"
         )
 
         if writer is not None:
             writer.add_scalar("loss/train", tr_loss, epoch)
             writer.add_scalar("acc/train", tr_acc, epoch)
             writer.add_scalar("acc/val_clean", val_acc, epoch)
-            writer.add_scalar("acc/ood_mean", mean_ood, epoch)
+            writer.add_scalar("acc/ood_val", ood_val_acc, epoch)
             writer.add_scalar("acc/score", score, epoch)
-            for k, v in ood_accs.items():
-                writer.add_scalar(f"acc/ood_{k}", v, epoch)
             writer.add_scalar("lr", lr_now, epoch)
+            writer.add_scalar("curriculum/phase", phase, epoch)
 
         if score > best_score:
             best_score = score
+            best = {"epoch": epoch, "val": val_acc, "ood_val": ood_val_acc}
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
+        # Curriculum switch (after this epoch's eval, so it affects the next one).
+        if phase == 1 and (val_acc >= args.aug_threshold or epoch >= force_switch_epoch):
+            reason = "val>=thresh" if val_acc >= args.aug_threshold else "force-by-epoch"
+            train_full.transform = build_heavy_transform()
+            train_loader = build_train_loader(train_set, args.batch_size, args.workers)
+            phase = 2
+            print(f"  -> [curriculum] HEAVY augmentation ON at epoch {epoch} "
+                  f"({reason}, val={val_acc:.3f})")
+
+    # Restore the selected checkpoint, then unfreeze the OOD-test ONCE on it.
+    assert best_state is not None
+    model.load_state_dict(best_state)
+    ood_test_acc = evaluate(model, ood_test_loader, device) if ood_test_loader else float("nan")
+    honest_score = 0.5 * best["val"] + 0.5 * ood_test_acc
+
+    print(
+        f"\nSelected epoch {best['epoch']}: "
+        f"clean_val {best['val']:.3f} | ood_val ({OOD_VAL_NAME}) {best['ood_val']:.3f}"
+    )
+    print(
+        f"FROZEN OOD-test ({OOD_TEST_NAME}): {ood_test_acc:.3f}  "
+        f"-> honest 50/50 estimate {honest_score:.3f}"
+    )
     if writer is not None:
+        writer.add_scalar("acc/ood_test_frozen", ood_test_acc, best["epoch"])
         writer.close()
 
     # Persist the best checkpoint as a CPU state_dict (hardware-independent).
-    assert best_state is not None
     joblib.dump(best_state, OUTPUT)
-    print(f"Saved best weights (score={best_score:.3f}) to {OUTPUT}")
+    print(f"Saved best weights to {OUTPUT}")
 
     # Sanity check: the saved file must reload into a fresh architecture,
     # exactly as the grader's predict.py does.
