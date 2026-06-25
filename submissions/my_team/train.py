@@ -240,15 +240,25 @@ def train_one_epoch(model, loader, criterion, optimizer, scheduler, device):
 
 
 @torch.no_grad()
-def evaluate(model, loader, device) -> float:
+def evaluate(model, loader, device, criterion=None):
+    """Return clean accuracy. If ``criterion`` is given, also return mean loss
+    as ``(acc, loss)`` so the caller can log validation loss."""
     model.eval()
     correct = torch.zeros((), device=device)
+    loss_sum = torch.zeros((), device=device)
     total = 0
     for x, y in loader:
         x, y = x.to(device), y.to(device)
-        correct += (model(x).argmax(1) == y).sum()
+        logits = model(x)
+        correct += (logits.argmax(1) == y).sum()
+        if criterion is not None:
+            loss_sum += criterion(logits, y).detach() * y.size(0)
         total += y.size(0)
-    return (correct / total).item() if total else 0.0
+    acc = (correct / total).item() if total else 0.0
+    if criterion is not None:
+        loss = (loss_sum / total).item() if total else 0.0
+        return acc, loss
+    return acc
 
 
 def build_scheduler(optimizer, epochs, steps_per_epoch, warmup_epochs=3):
@@ -482,10 +492,13 @@ def main():
         tr_loss, tr_acc = train_one_epoch(
             model, train_loader, criterion, optimizer, scheduler, device
         )
-        val_acc = evaluate(model, val_loader, device)
+        val_acc, val_loss = evaluate(model, val_loader, device, criterion)
         # OOD-val (color_jitter) is allowed to influence selection; OOD-test
         # (random_rotation) is deliberately NOT evaluated here -- it stays frozen.
-        ood_val_acc = evaluate(model, ood_val_loader, device) if ood_val_loader else val_acc
+        if ood_val_loader:
+            ood_val_acc, ood_val_loss = evaluate(model, ood_val_loader, device, criterion)
+        else:
+            ood_val_acc, ood_val_loss = val_acc, val_loss
         # Selection metric mirrors the 50/50 clean-vs-OOD grading.
         score = 0.5 * val_acc + 0.5 * ood_val_acc
 
@@ -493,11 +506,13 @@ def main():
         print(
             f"epoch {epoch:3d}/{epochs} | lr {lr_now:.4f} | phase {phase} | "
             f"train_loss {tr_loss:.3f} acc {tr_acc:.3f} | "
-            f"val {val_acc:.3f} | ood_val {ood_val_acc:.3f} | score {score:.3f}"
+            f"val {val_acc:.3f} loss {val_loss:.3f} | ood_val {ood_val_acc:.3f} | score {score:.3f}"
         )
 
         if writer is not None:
             writer.add_scalar("loss/train", tr_loss, epoch)
+            writer.add_scalar("loss/val_clean", val_loss, epoch)
+            writer.add_scalar("loss/ood_val", ood_val_loss, epoch)
             writer.add_scalar("acc/train", tr_acc, epoch)
             writer.add_scalar("acc/val_clean", val_acc, epoch)
             writer.add_scalar("acc/ood_val", ood_val_acc, epoch)
@@ -525,7 +540,10 @@ def main():
     # Restore the selected checkpoint, then unfreeze the OOD-test ONCE on it.
     assert best_state is not None
     model.load_state_dict(best_state)
-    ood_test_acc = evaluate(model, ood_test_loader, device) if ood_test_loader else float("nan")
+    if ood_test_loader:
+        ood_test_acc, ood_test_loss = evaluate(model, ood_test_loader, device, criterion)
+    else:
+        ood_test_acc, ood_test_loss = float("nan"), float("nan")
     honest_score = 0.5 * best["val"] + 0.5 * ood_test_acc
 
     print(
@@ -538,6 +556,7 @@ def main():
     )
     if writer is not None:
         writer.add_scalar("acc/ood_test_frozen", ood_test_acc, best["epoch"])
+        writer.add_scalar("loss/ood_test_frozen", ood_test_loss, best["epoch"])
 
         log_confusion_matrix(model, val_loader, device, writer,
                              class_names_list, step=best["epoch"],

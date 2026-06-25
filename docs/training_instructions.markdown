@@ -62,8 +62,8 @@ tensorboard --logdir submissions/my_team/runs
 
 | TensorBoard tab | Tag(s) | Content |
 |-----------------|--------|---------|
-| SCALARS | `loss/train`, `acc/train`, `acc/val_clean`, `acc/ood_val`, `acc/score`, `lr`, `curriculum/phase`, `time/epoch_sec` | Per-epoch training/eval curves |
-| SCALARS | `acc/ood_test_frozen` | Frozen `random_rotation` accuracy (logged once, at the selected epoch) |
+| SCALARS | `loss/train`, `loss/val_clean`, `loss/ood_val`, `acc/train`, `acc/val_clean`, `acc/ood_val`, `acc/score`, `lr`, `curriculum/phase`, `time/epoch_sec` | Per-epoch training/eval curves (train + **validation loss** on both clean and color_jitter splits) |
+| SCALARS | `acc/ood_test_frozen`, `loss/ood_test_frozen` | Frozen `random_rotation` accuracy + loss (logged once, at the selected epoch) |
 | GRAPHS | — | The model compute graph |
 | IMAGES | `data/sample_images` | A grid of (de-normalized) training images |
 | IMAGES | `eval/confusion_matrix`, `eval/predictions` | Final confusion matrix + a labeled prediction grid (green=correct, red=wrong) |
@@ -72,6 +72,43 @@ tensorboard --logdir submissions/my_team/runs
 | HPARAMS | `hparam/val_clean`, `hparam/ood_val`, `hparam/ood_test_frozen`, `hparam/honest_score` | Hyperparameters vs final metrics, for cross-run comparison |
 
 The confusion matrix and prediction grid require **matplotlib** (and numpy); if they are not installed those two figures are silently skipped and the rest of the logging still runs. All TensorBoard logging is best-effort and never breaks training.
+
+### Loss tracking
+
+`evaluate()` returns `(acc, loss)` when passed the training criterion, so the
+loop now logs **validation loss** (CrossEntropy with the same `label_smoothing`
+as training) alongside accuracy. The per-epoch stdout line carries the clean-val
+loss, e.g.:
+
+```
+epoch  45/50 | lr 0.0028 | phase 2 | train_loss 0.696 acc 0.971 | val 0.924 loss 0.812 | ood_val 0.940 | score 0.932
+```
+
+and `loss/val_clean`, `loss/ood_val`, `loss/ood_test_frozen` are written to
+TensorBoard for the loss curves. Watching val loss (not just val accuracy) is
+the cleaner overfitting signal: accuracy can plateau while loss starts creeping
+back up. Calling `evaluate()` *without* a criterion still returns a bare float,
+so older call sites are unaffected.
+
+## Post-run Evaluation (`evaluate_model.py`)
+
+[`submissions/my_team/evaluate_model.py`](../submissions/my_team/evaluate_model.py)
+re-scores a saved checkpoint **without retraining**, reporting both loss and
+accuracy on the same three splits the training loop tracks:
+
+```bash
+python submissions/my_team/evaluate_model.py                       # default weights.joblib
+python submissions/my_team/evaluate_model.py --weights path/to.joblib
+python submissions/my_team/evaluate_model.py --tb                  # also log to a TensorBoard run dir
+```
+
+It reuses `train.py`'s exact transforms, split seed, and `evaluate()` so the
+numbers line up with the run log, rebuilds the clean-val split with the same
+`SEED`/`VAL_FRACTION`, prints an `acc | loss` table per split, and recomputes the
+honest 50/50 estimate (`0.5·clean_val + 0.5·ood_test`). This is the
+independent cross-check path: a checkpoint is verified here, separate from the
+training loop, before any headline number is trusted (see
+[debugging_notes.markdown](debugging_notes.markdown)).
 
 ## Sharing Results Across the Team
 

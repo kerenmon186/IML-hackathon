@@ -98,3 +98,11 @@ Reload check OK: weights.joblib matches ModelArchitecture.
   checkpoint selected at epoch 45 (highest `0.5·clean + 0.5·color_jitter`).
 - **Frozen test:** `random_rotation` = 0.935, a manipulation never trained on —
   essentially equal to clean accuracy, the headline robustness result.
+
+> **Log format note:** this archived log predates the validation-loss change, so
+> its per-epoch lines show only accuracies (`val 0.924 | ood_val 0.940`). Current
+> runs add a clean-val `loss` field to each line (`val 0.924 loss 0.812 | …`) and
+> log `loss/val_clean`, `loss/ood_val`, `loss/ood_test_frozen` to TensorBoard.
+> Re-score any saved checkpoint's per-split loss + accuracy without retraining
+> via [`evaluate_model.py`](../submissions/my_team/evaluate_model.py) — see
+> [training_instructions.markdown](training_instructions.markdown#post-run-evaluation-evaluate_modelpy).
