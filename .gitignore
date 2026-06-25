@@ -12,7 +12,8 @@ __pycache__/
 /submissions/my_team/weights.joblib
 /weights_baseline_main.joblib
 /challenge 2 files/
-
 # local run archives (large binaries)
 /base/
 /base-run.zip
+# weight backups
+/backups/
