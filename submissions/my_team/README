@@ -63,12 +63,12 @@ random_rotation exactly once, on the selected checkpoint.
 How it impacted performance
 ---------------------------
 Checkpoint selected by 0.5*clean-val + 0.5*OOD-val (mirrors the 50/50 grade):
-- Clean validation accuracy:                0.923
+- Clean validation accuracy:                0.924
 - color_jitter (trained-against OOD-val):   0.940
-- random_rotation (FROZEN, never trained):  0.920
+- random_rotation (FROZEN, never trained):  0.935
 
 The headline result: random_rotation -- a manipulation we never trained on --
-holds at 0.920, essentially equal to clean accuracy. Before the curriculum
+holds at 0.935, essentially equal to clean accuracy. Before the curriculum
 switch the OOD sets lagged clean accuracy by ~5 points; once heavy augmentation
 turned on, that gap closed to ~1-2 points and the OOD accuracy often slightly
 exceeded clean accuracy. The train/val gap stayed small (~5 points) with val
