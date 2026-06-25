@@ -18,6 +18,7 @@ kept out of training so `random_rotation` stays a valid frozen OOD-test.
 import argparse
 import math
 import sys
+import time
 from pathlib import Path
 
 import joblib
@@ -25,6 +26,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
 from torchvision import transforms
+from torchvision.utils import make_grid
 
 # --- Make the project-root modules (base_model, labels) importable no matter
 #     where this script is launched from. ----------------------------------
@@ -34,7 +36,18 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from base_model import ImageNetSubset  # noqa: E402
+from labels import IDX_TO_NAME  # noqa: E402
 from model import ModelArchitecture  # noqa: E402
+
+_MPL_OK = False
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+    _MPL_OK = True
+except ImportError:
+    pass
 
 # --- Paths ------------------------------------------------------------------
 DATA_ROOT = PROJECT_ROOT / "dataset"
@@ -72,21 +85,21 @@ def get_device() -> torch.device:
 # ---------------------------------------------------------------------------
 # Transforms
 # ---------------------------------------------------------------------------
-def build_light_transform() -> transforms.Compose:
+def build_light_transform(image_size: int = IMAGE_SIZE) -> transforms.Compose:
     """Phase-1 (pre-threshold) augmentation: gentle geometry only.
 
     Heavy colour/occlusion augmentation from step 0 slows a from-scratch model.
     Phase 1 keeps it near-clean so the network can build solid features fast.
     """
     return transforms.Compose([
-        transforms.RandomResizedCrop(IMAGE_SIZE, scale=(0.7, 1.0)),
+        transforms.RandomResizedCrop(image_size, scale=(0.7, 1.0)),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
         transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
     ])
 
 
-def build_heavy_transform() -> transforms.Compose:
+def build_heavy_transform(image_size: int = IMAGE_SIZE) -> transforms.Compose:
     """Phase-2 (post-threshold) augmentation: the robustness driver.
 
     Switched on once the model passes a clean-val threshold. Targets the exact
@@ -97,7 +110,7 @@ def build_heavy_transform() -> transforms.Compose:
     Colour jitter IS included -- `color_jitter` is the tuning OOD signal.
     """
     return transforms.Compose([
-        transforms.RandomResizedCrop(IMAGE_SIZE, scale=(0.5, 1.0)),
+        transforms.RandomResizedCrop(image_size, scale=(0.5, 1.0)),
         transforms.RandomHorizontalFlip(),
         transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1),
         transforms.RandomGrayscale(p=0.1),
@@ -107,11 +120,16 @@ def build_heavy_transform() -> transforms.Compose:
     ])
 
 
-def build_eval_transform() -> transforms.Compose:
-    """Must match the grader's preprocessing exactly (see evaluate.py)."""
+def build_eval_transform(image_size: int = IMAGE_SIZE) -> transforms.Compose:
+    """Must match the grader's preprocessing exactly (see evaluate.py).
+
+    `image_size` is only overridden for the smoke test; at the default it
+    reproduces the grader's 256-resize / 224-crop exactly.
+    """
+    resize = round(image_size * 256 / IMAGE_SIZE)
     return transforms.Compose([
-        transforms.Resize(256),
-        transforms.CenterCrop(IMAGE_SIZE),
+        transforms.Resize(resize),
+        transforms.CenterCrop(image_size),
         transforms.ToTensor(),
         transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
     ])
@@ -247,6 +265,90 @@ def build_scheduler(optimizer, epochs, steps_per_epoch, warmup_epochs=3):
 
 
 # ---------------------------------------------------------------------------
+# TensorBoard helpers
+# ---------------------------------------------------------------------------
+def log_weight_histograms(model, writer, step):
+    if writer is None:
+        return
+    for name, param in model.named_parameters():
+        writer.add_histogram(f"weights/{name}", param.detach().cpu(), step)
+        if param.grad is not None:
+            writer.add_histogram(f"grads/{name}", param.grad.detach().cpu(), step)
+
+
+def log_sample_images(loader, writer, tag, n=32):
+    if writer is None:
+        return
+    images, _ = next(iter(loader))
+    images = images[:n]
+    mean = torch.tensor(IMAGENET_MEAN).view(3, 1, 1)
+    std = torch.tensor(IMAGENET_STD).view(3, 1, 1)
+    images = (images * std + mean).clamp(0, 1)
+    writer.add_image(tag, make_grid(images, nrow=8), 0)
+
+
+def log_confusion_matrix(model, loader, device, writer, class_names, step, tag):
+    if not _MPL_OK or writer is None:
+        return
+    n = len(class_names)
+    cm = np.zeros((n, n), dtype=int)
+    model.eval()
+    with torch.no_grad():
+        for x, y in loader:
+            x, y = x.to(device), y.to(device)
+            preds = model(x).argmax(1).cpu().numpy()
+            for t, p in zip(y.cpu().numpy(), preds):
+                cm[t, p] += 1
+    fig, ax = plt.subplots(figsize=(10, 9))
+    im = ax.imshow(cm, interpolation="nearest", cmap=plt.cm.Blues)
+    fig.colorbar(im, ax=ax)
+    ax.set_xticks(range(n))
+    ax.set_yticks(range(n))
+    ax.set_xticklabels(class_names, rotation=90, fontsize=7)
+    ax.set_yticklabels(class_names, fontsize=7)
+    thresh = cm.max() / 2.0
+    for i in range(n):
+        for j in range(n):
+            ax.text(j, i, str(cm[i, j]), ha="center", va="center", fontsize=6,
+                    color="white" if cm[i, j] > thresh else "black")
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("True")
+    fig.tight_layout()
+    writer.add_figure(tag, fig, step)
+    plt.close(fig)
+
+
+def log_predictions_grid(model, loader, device, writer, class_names, step, tag):
+    if not _MPL_OK or writer is None:
+        return
+    images, labels = next(iter(loader))
+    n = min(16, len(images))
+    images, labels = images[:n], labels[:n]
+    model.eval()
+    with torch.no_grad():
+        preds = model(images.to(device)).argmax(1).cpu()
+    mean = torch.tensor(IMAGENET_MEAN).view(3, 1, 1)
+    std = torch.tensor(IMAGENET_STD).view(3, 1, 1)
+    imgs_show = (images * std + mean).clamp(0, 1).permute(0, 2, 3, 1).numpy()
+    cols = 4
+    rows = (n + cols - 1) // cols
+    fig, axes = plt.subplots(rows, cols, figsize=(cols * 3, rows * 3))
+    axes = axes.flatten()
+    for i in range(n):
+        correct = preds[i].item() == labels[i].item()
+        axes[i].imshow(imgs_show[i])
+        axes[i].set_title(
+            f"P: {class_names[preds[i]]}\nT: {class_names[labels[i]]}",
+            color="green" if correct else "red", fontsize=7)
+        axes[i].axis("off")
+    for i in range(n, len(axes)):
+        axes[i].axis("off")
+    fig.tight_layout()
+    writer.add_figure(tag, fig, step)
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def parse_args():
@@ -273,11 +375,17 @@ def main():
     device = get_device()
     print(f"Device: {device}")
 
-    eval_tf = build_eval_transform()
+    # Smoke runs at a small resolution on a tiny subset: the point is to
+    # exercise the *pipeline* (loading, curriculum switch, TB logging,
+    # checkpoint save/reload) fast -- not to reach real accuracy. 224x224 on
+    # CPU is minutes/epoch; 64x64 is seconds/epoch so the board fills quickly.
+    img_size = 64 if args.smoke else IMAGE_SIZE
+
+    eval_tf = build_eval_transform(img_size)
     train_idx, val_idx = make_splits()
     # `train_full` carries the *current* augmentation; we mutate its .transform
     # at the curriculum switch and rebuild the loader so workers pick it up.
-    train_full = ImageNetSubset(DATA_ROOT, "train", transform=build_light_transform())
+    train_full = ImageNetSubset(DATA_ROOT, "train", transform=build_light_transform(img_size))
     val_full = ImageNetSubset(DATA_ROOT, "train", transform=eval_tf)
     train_set = Subset(train_full, train_idx)
     val_set = Subset(val_full, val_idx)
@@ -294,10 +402,11 @@ def main():
         # Sample randomly (not range()) so the subsets stay class-balanced --
         # the splits are class-ordered, so range() would grab one class.
         g = torch.Generator().manual_seed(SEED)
-        ti = torch.randperm(len(train_set), generator=g)[:1500].tolist()
-        vi = torch.randperm(len(val_set), generator=g)[:500].tolist()
+        ti = torch.randperm(len(train_set), generator=g)[:256].tolist()
+        vi = torch.randperm(len(val_set), generator=g)[:128].tolist()
         train_set, val_set = Subset(train_set, ti), Subset(val_set, vi)
-        print(f"[smoke] {len(train_set)} train / {len(val_set)} val, {epochs} epochs")
+        print(f"[smoke] {len(train_set)} train / {len(val_set)} val, "
+              f"{epochs} epochs, {img_size}x{img_size} images")
 
     train_loader = build_train_loader(train_set, args.batch_size, args.workers)
     val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False,
@@ -309,12 +418,50 @@ def main():
                                 weight_decay=args.weight_decay, nesterov=True)
     scheduler = build_scheduler(optimizer, epochs, len(train_loader))
 
-    # TensorBoard logging (optional, available in this env). Launch with:
+    total_params = sum(p.numel() for p in model.parameters())
+    class_names_list = [IDX_TO_NAME[i] for i in range(NUM_CLASSES)]
+
+    # TensorBoard logging (optional). Each run gets an isolated timestamped dir.
     #   tensorboard --logdir submissions/my_team/runs
     writer = None
     try:
         from torch.utils.tensorboard import SummaryWriter
-        writer = SummaryWriter(log_dir=str(TB_LOGDIR))
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        _arch_name = type(model).__name__.lower()
+        run_dir = TB_LOGDIR / f"{_arch_name}_{ts}"
+        writer = SummaryWriter(log_dir=str(run_dir))
+        print(f"TensorBoard: tensorboard --logdir {TB_LOGDIR}  (run: {run_dir.name})")
+
+        try:
+            _sample = torch.zeros(1, 3, img_size, img_size, device=device)
+            writer.add_graph(model, _sample)
+        except Exception as _e:
+            print(f"add_graph skipped: {_e}")
+
+        writer.add_text("model/architecture",
+            f"**Class**: `{type(model).__name__}`\n\n"
+            f"**Total params**: {total_params:,}\n\n"
+            f"```\n{model}\n```", 0)
+
+        _n_ood_val = len(ood_val_loader.dataset) if ood_val_loader else "N/A"
+        _n_ood_test = len(ood_test_loader.dataset) if ood_test_loader else "N/A"
+        writer.add_text("data/info", "\n".join([
+            "| Key | Value |", "| --- | --- |",
+            f"| dataset_root | `{DATA_ROOT}` |",
+            f"| classes | {', '.join(class_names_list)} |",
+            f"| num_train | {len(train_set)} |",
+            f"| num_val | {len(val_set)} |",
+            f"| ood_val ({OOD_VAL_NAME}) | {_n_ood_val} |",
+            f"| ood_test ({OOD_TEST_NAME}) | {_n_ood_test} |",
+            f"| split_seed | {SEED} |",
+            f"| aug_threshold | {args.aug_threshold} |",
+            f"| force_switch_frac | {args.force_switch_frac} |",
+            f"| phase1 | RandomResizedCrop(0.7-1.0) + HFlip |",
+            f"| phase2 | adds ColorJitter + RandomGrayscale + RandomErasing |",
+        ]), 0)
+
+        log_sample_images(train_loader, writer, tag="data/sample_images")
+
     except Exception as e:  # pragma: no cover - logging must never break training
         print(f"(TensorBoard disabled: {e})")
 
@@ -331,6 +478,7 @@ def main():
           f"or epoch {force_switch_epoch} (whichever first)")
 
     for epoch in range(1, epochs + 1):
+        _epoch_start = time.time()
         tr_loss, tr_acc = train_one_epoch(
             model, train_loader, criterion, optimizer, scheduler, device
         )
@@ -356,6 +504,9 @@ def main():
             writer.add_scalar("acc/score", score, epoch)
             writer.add_scalar("lr", lr_now, epoch)
             writer.add_scalar("curriculum/phase", phase, epoch)
+            writer.add_scalar("time/epoch_sec", time.time() - _epoch_start, epoch)
+            if epoch % 5 == 0:
+                log_weight_histograms(model, writer, epoch)
 
         if score > best_score:
             best_score = score
@@ -365,7 +516,7 @@ def main():
         # Curriculum switch (after this epoch's eval, so it affects the next one).
         if phase == 1 and (val_acc >= args.aug_threshold or epoch >= force_switch_epoch):
             reason = "val>=thresh" if val_acc >= args.aug_threshold else "force-by-epoch"
-            train_full.transform = build_heavy_transform()
+            train_full.transform = build_heavy_transform(img_size)
             train_loader = build_train_loader(train_set, args.batch_size, args.workers)
             phase = 2
             print(f"  -> [curriculum] HEAVY augmentation ON at epoch {epoch} "
@@ -387,6 +538,38 @@ def main():
     )
     if writer is not None:
         writer.add_scalar("acc/ood_test_frozen", ood_test_acc, best["epoch"])
+
+        log_confusion_matrix(model, val_loader, device, writer,
+                             class_names_list, step=best["epoch"],
+                             tag="eval/confusion_matrix")
+        log_predictions_grid(model, val_loader, device, writer,
+                             class_names_list, step=best["epoch"],
+                             tag="eval/predictions")
+        log_weight_histograms(model, writer, step=best["epoch"])
+
+        hparams = {
+            "epochs":            args.epochs,
+            "batch_size":        args.batch_size,
+            "lr":                args.lr,
+            "weight_decay":      args.weight_decay,
+            "label_smoothing":   args.label_smoothing,
+            "aug_threshold":     args.aug_threshold,
+            "force_switch_frac": args.force_switch_frac,
+            "total_params":      int(total_params),
+        }
+        metrics = {
+            "hparam/val_clean":       best["val"],
+            "hparam/ood_val":         best["ood_val"],
+            "hparam/ood_test_frozen": ood_test_acc,
+            "hparam/honest_score":    honest_score,
+        }
+        writer.add_hparams(hparams, metrics)
+
+        rows = [f"| {k} | {v} |" for k, v in {**hparams, **metrics}.items()]
+        writer.add_text("run/summary",
+            "| Param | Value |\n| --- | --- |\n" + "\n".join(rows), 0)
+
+        writer.flush()
         writer.close()
 
     # Persist the best checkpoint as a CPU state_dict (hardware-independent).
