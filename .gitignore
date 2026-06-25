@@ -6,6 +6,8 @@ __pycache__/
 /dataset/augmentations/*
 # tensorboard logs
 /submissions/*/runs/
+# archived run artifacts (TB logs, weights, train logs per run)
+/runs/
 # the weights
 /submissions/my_team/weights.joblib
 /weights_baseline_main.joblib
