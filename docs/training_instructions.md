@@ -73,6 +73,17 @@ tensorboard --logdir submissions/my_team/runs
 
 The confusion matrix and prediction grid require **matplotlib** (and numpy); if they are not installed those two figures are silently skipped and the rest of the logging still runs. All TensorBoard logging is best-effort and never breaks training.
 
+## Sharing Results Across the Team
+
+TensorBoard is a **local viewer**, not a shared service — `tensorboard --logdir runs` only shows the runs on *your own* machine. Since we work on separate laptops there's no shared `runs/` folder, and `runs/` is intentionally git-ignored (event files are large binaries that bloat history and merge-conflict). So the convention is:
+
+1. **Commit the results table.** Record every meaningful run's config + scores in [exploration_and_tuning_report.md](exploration_and_tuning_report.md). This is the team's shared source of truth — small, diffable, and renders on GitHub.
+2. **Zip-share the odd run** when a specific one is worth inspecting together. Each run dir is self-contained:
+   ```bash
+   zip -r run.zip submissions/my_team/runs/modelarchitecture_20260625_143000
+   ```
+   Drop it in the team chat / Drive; whoever wants to look unzips it and runs `tensorboard --logdir <unzipped path>` locally.
+
 ## OOD Evaluation Policy
 
 Two augmentation types exist under `dataset/augmentations/`:
