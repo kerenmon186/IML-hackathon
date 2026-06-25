@@ -4,3 +4,4 @@
 /submissions/*/runs/
 # the weights
 /submissions/my_team/weights.joblib
+/weights_baseline_main.joblib
