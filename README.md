@@ -1,8 +1,12 @@
-# IML Hackathon: Robust 20-Class Image Classification
+# Robust 20-Class Image Classification
 
-A ResNet-18 trained from scratch (PyTorch) to classify images into 20 classes and stay accurate under image manipulations it never saw during training. Built as a team project for the Introduction to Machine Learning (IML) hackathon at the Hebrew University of Jerusalem.
+A ResNet-18 trained from scratch (PyTorch) to classify images into 20 classes and stay accurate under visual manipulations it never saw during training. Built as a team project for Challenge 2 of the Introduction to Machine Learning (67577) Hackathon 2026 at the Hebrew University of Jerusalem.
 
 **Team:** David Kaluta, Dana Kimelman, Keren Monsonego, Shaima Zbeda
+
+## The challenge
+
+Image classifiers can rely on misleading cues such as the background, so a prediction can change when the lighting, color or context changes while the object stays the same. The task: train a model from random initialization (no pretrained models, no external data) that does well on clean images and on held-out manipulated images. The final test set is split evenly between the two, so the score rewards both accuracy and robustness.
 
 ## Results
 
@@ -34,9 +38,12 @@ Before the switch, the out-of-distribution sets lagged clean accuracy by about 5
 
 ## Repository structure
 
-- `submissions/my_team/` - the team's submission and write-up
+- `submissions/my_team/` - the team's submission: `model.py` (`ModelArchitecture`), `train.py`, `predict.py`, and a README with the full write-up
+- `base_model.py`, `labels.py`, `evaluate.py`, `check_submission.py` - starter files provided by the course
 - `colab.ipynb` - Google Colab notebook
 - `requirements.txt`, `pyproject.toml` - dependencies (Python 3.13)
+
+The dataset is not included in this repository.
 
 ## Setup
 
@@ -44,7 +51,7 @@ Before the switch, the out-of-distribution sets lagged clean accuracy by about 5
 pip install -r requirements.txt
 ```
 
-Training can also be run in Google Colab with `colab.ipynb`.
+Training saves the model weights to `weights.joblib`. It can also be run in Google Colab with `colab.ipynb`.
 
 ## Tech
 
